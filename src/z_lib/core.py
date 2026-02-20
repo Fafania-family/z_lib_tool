@@ -23,26 +23,16 @@ class Z_Lib:
     def load_zip(self, *paths: str, create: bool = False, mode: OpenMode = "rw") -> None:
         """
         Load one or more ZIP files.
-        
-        Args:
-            paths: Variable number of ZIP file paths.
-            create: If True, allow creating new ZIP files.
-            mode: "r" for read-only (changes are discarded), "rw" for read-write.
         """
         for path in paths:
-            norm_path = normalize_path(path)
+            # 正規化だけでなく、絶対パスに解決して一貫性を持たせる
+            abs_path = Path(path).resolve()
+            norm_path = normalize_path(str(abs_path))
             
             if norm_path in self._loaded_zips:
-                # Decide behavior: raise error or ignore?
-                # Design doc implies declarative state, so if already loaded with same mode, maybe ignore.
-                # However, re-loading with different mode might be ambiguous.
-                # For safety, raise error for now, or just return if it's already there.
-                # Project spec: "未ロードの...操作...例外" -> implying strict state.
-                # Let's check if it exists to prevent double mounting which wastes temp dir.
                 continue
                 
             handle = self._backend.open(path, create=create, mode=mode)
-            # Store by normalized path to ensure consistent lookup
             self._loaded_zips[norm_path] = handle
 
     def unload_zip(self, *paths: str) -> None:
@@ -50,7 +40,8 @@ class Z_Lib:
         Unload one or more ZIP files, saving changes if mode is "rw".
         """
         for path in paths:
-            norm_path = normalize_path(path)
+            abs_path = Path(path).resolve()
+            norm_path = normalize_path(str(abs_path))
             
             if norm_path not in self._loaded_zips:
                 continue

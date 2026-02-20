@@ -33,26 +33,30 @@ def split_zip_path(path: str) -> Tuple[Optional[str], str]:
 def find_longest_match_handle(path: str, loaded_zips: Dict[str, ZipHandle]) -> Tuple[Optional[ZipHandle], str]:
     """
     Find the best matching loaded ZIP handle for the given path using longest match.
-    
-    Args:
-        path: The virtual path to resolve.
-        loaded_zips: Dictionary of loaded ZIP handles. Keys must be normalized strings.
-        
-    Returns:
-        Tuple (handle, internal_path). Handle is None if no match found.
     """
     norm_path = normalize_path(path)
+    parts = norm_path.split("/")
     
-    # Sort keys by length descending to ensure we match nested zips (a.zip/b.zip) before parent (a.zip)
-    # We assume verify keys in loaded_zips are already normalized.
-    sorted_keys = sorted(loaded_zips.keys(), key=len, reverse=True)
-    
-    for zip_key in sorted_keys:
-        # Check if path is exactly the zip_key or starts with zip_key + "/"
-        if norm_path == zip_key or norm_path.startswith(zip_key + "/"):
-            handle = loaded_zips[zip_key]
-            internal_path = norm_path[len(zip_key):].lstrip("/")
+    # 1. 文字列としての単純な最長一致を試す (高速化 & モックパス/テスト用)
+    for i in range(len(parts), 0, -1):
+        potential = "/".join(parts[:i])
+        if potential in loaded_zips:
+            handle = loaded_zips[potential]
+            internal_path = "/".join(parts[i:])
             return handle, internal_path
+
+    # 2. 物理パス（絶対パス）に解決して一致を試す (絶対・相対混在対応)
+    for i in range(len(parts), 0, -1):
+        potential_zip_path_str = "/".join(parts[:i])
+        try:
+            # 物理パスとして解決。存在しないパスの場合は失敗 or カレントディレクトリベースの解決になる
+            abs_potential = normalize_path(str(Path(potential_zip_path_str).resolve()))
+            if abs_potential in loaded_zips:
+                handle = loaded_zips[abs_potential]
+                internal_path = "/".join(parts[i:])
+                return handle, internal_path
+        except Exception:
+            continue
             
     return None, path
 
