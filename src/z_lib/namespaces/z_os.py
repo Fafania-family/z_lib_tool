@@ -95,35 +95,19 @@ class Z_OS:
                 onerror(e)
             return
 
+        # ロード済みZIPキーを正規化済みセットとして準備
+        loaded_zip_norms = set(loaded_zips.keys())
+
         sub_dirs: List[str] = []
         sub_files: List[str] = []
         # エントリを仕分け：ロード済みZIPはディレクトリ扱い
         zip_entries: List[str] = []  # このディレクトリ内のロード済みZIP名
 
         for entry in entries:
+            norm_entry = normalize_path(str(entry.resolve()))
             if entry.is_dir() and not (entry.is_symlink() and not followlinks):
                 sub_dirs.append(entry.name)
-                continue
-
-            # ロード済みZIPかどうかを物理パスで判定
-            is_loaded_zip = False
-            try:
-                entry_abs = entry.resolve()
-                for loaded_path_str in loaded_zips.keys():
-                    try:
-                        # os.path.samefile は大文字小文字や表現の揺れを解決して同じファイルか判定する
-                        if os.path.samefile(str(entry_abs), loaded_path_str):
-                            is_loaded_zip = True
-                            break
-                    except (OSError, ValueError):
-                        # ロード済みパスが既に削除されている等の場合はフォールバック
-                        if normalize_path(str(entry_abs)) == loaded_path_str:
-                            is_loaded_zip = True
-                            break
-            except Exception:
-                pass
-
-            if is_loaded_zip:
+            elif norm_entry in loaded_zip_norms:
                 # ロード済みZIPをディレクトリとして扱う
                 zip_entries.append(entry.name)
             else:
