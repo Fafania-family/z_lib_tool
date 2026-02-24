@@ -14,7 +14,7 @@ ZIPファイルとローカルファイルを透過的に扱うためのPython�
 ## インストール
 
 ```bash
-uv add git+https://github.com/H-Nafania/z-lib-tool.git
+uv add git+https://github.com/Nafania-family/z-lib-tool.git
 ```
 
 ## 使い方
