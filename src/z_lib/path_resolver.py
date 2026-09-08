@@ -1,90 +1,101 @@
 import os
-import re
 from pathlib import Path
 from typing import Tuple, Optional, Any, Dict
-from .exceptions import ZipPathError, ZipNotLoadedError
-from ._types import ZipHandle
+from .exceptions import ZipNotLoadedError, ZipSecurityError
+
 
 def normalize_path(path: Any) -> str:
-    """
-    Normalize path separators to forward slashes for internal consistency.
-    Accepts both str and pathlib.Path objects.
-    """
+    """内部表記の一貫性のために区切り文字をスラッシュに統一する"""
     return str(path).replace("\\", "/")
 
+
+def normalize_lookup_key(path: Any) -> str:
+    """
+    Windows等での大文字小文字の差異や相対・絶対パスの揺らぎを吸収し、
+    同一ZIPファイルを確実に同一キーとして照合するための正規化キーを生成する。
+    """
+    p = Path(path)
+    try:
+        resolved = p.resolve()
+        return os.path.normcase(str(resolved)).replace("\\", "/")
+    except Exception:
+        return os.path.normcase(str(p)).replace("\\", "/")
+
+
 def split_zip_path(path: str) -> Tuple[Optional[str], str]:
-    """
-    Split a path into the ZIP file path and the internal path.
-    Use simple heuristic: first component ending with .zip is the ZIP path.
-    """
+    """パス文字列からZIPファイルパスとZIP内相対パスを分離する"""
     norm_path = normalize_path(path)
     parts = norm_path.split("/")
-    
+
     current_path_parts = []
     for i, part in enumerate(parts):
         current_path_parts.append(part)
         if part.lower().endswith(".zip"):
             zip_path = "/".join(current_path_parts)
-            internal_parts = parts[i+1:]
+            internal_parts = parts[i + 1:]
             internal_path = "/".join(internal_parts)
             return zip_path, internal_path
-            
+
     return None, path
 
-def find_longest_match_handle(path: str, loaded_zips: Dict[str, ZipHandle]) -> Tuple[Optional[ZipHandle], str]:
+
+def find_matching_session(path: str, sessions: Dict[str, Any]) -> Tuple[Optional[Any], str]:
     """
-    Find the best matching loaded ZIP handle for the given path using longest match.
+    指定パスに該当するロード済みセッション（またはZipHandle）を最長一致で検索する。
+    キーの照合はnormalize_lookup_keyで行い、環境依存の表記揺れを防ぐ。
     """
     norm_path = normalize_path(path)
     parts = norm_path.split("/")
-    
-    # 1. 文字列としての単純な最長一致を試す (高速化 & モックパス/テスト用)
+
+    # 1. 物理パス解決によるキー一致の検索
     for i in range(len(parts), 0, -1):
         potential = "/".join(parts[:i])
-        if potential in loaded_zips:
-            handle = loaded_zips[potential]
+        lookup_key = normalize_lookup_key(potential)
+        if lookup_key in sessions:
+            session = sessions[lookup_key]
             internal_path = "/".join(parts[i:])
-            return handle, internal_path
+            return session, internal_path
 
-    # 2. 物理パス（絶対パス）に解決して一致を試す (絶対・相対混在対応)
+    # 2. テスト用モックパスや未作成パス向けの単純一致フォールバック
     for i in range(len(parts), 0, -1):
-        potential_zip_path_str = "/".join(parts[:i])
-        try:
-            # 物理パスとして解決。存在しないパスの場合は失敗 or カレントディレクトリベースの解決になる
-            abs_potential = normalize_path(str(Path(potential_zip_path_str).resolve()))
-            if abs_potential in loaded_zips:
-                handle = loaded_zips[abs_potential]
-                internal_path = "/".join(parts[i:])
-                return handle, internal_path
-        except Exception:
-            continue
-            
+        potential = "/".join(parts[:i])
+        if potential in sessions:
+            session = sessions[potential]
+            internal_path = "/".join(parts[i:])
+            return session, internal_path
+
     return None, path
 
-def resolve_to_real_path(path: str, loaded_zips: Dict[str, ZipHandle]) -> Path:
+
+def resolve_to_real_path(path: str, sessions: Dict[str, Any]) -> Path:
     """
-    Resolve a virtual path to a real temporary filesystem path.
-    
-    Args:
-        path: The virtual path string.
-        loaded_zips: A dictionary mapping resolved ZIP paths to ZipHandle.
-        
-    Returns:
-        A pathlib.Path object pointing to the real file on disk.
-        If path corresponds to a loaded ZIP root, returns the temp_dir.
-        
-    Raises:
-        ZipNotLoadedError: If the ZIP file part of the path is not loaded.
+    仮想パスをディスク上の実パス（展開先一時ディレクトリ内）に解決する。
+    パス脱出（Zip Slip）の検証も行う。
     """
-    handle, internal_path = find_longest_match_handle(path, loaded_zips)
-    
-    if handle:
-        return Path(handle["temp_dir"]) / internal_path
-    
-    # If no handle matched, check if it looks like a zip path to give a better error
+    session, internal_path = find_matching_session(path, sessions)
+
+    if session:
+        temp_dir_raw = session.temp_dir if hasattr(session, "temp_dir") else session["temp_dir"]
+        temp_dir = Path(temp_dir_raw)
+
+        # internal_path の相対パストラバーサルを検証
+        cleaned_internal = internal_path.replace("\\", "/").lstrip("/")
+        if cleaned_internal.startswith("../") or "/../" in cleaned_internal or cleaned_internal == "..":
+            raise ZipSecurityError(f"Directory traversal detected in internal path: {path}")
+
+        # 相対パーツに '..' が含まれていないかをパーツ単位でも念入りに確認
+        parts = Path(cleaned_internal).parts
+        if ".." in parts:
+            raise ZipSecurityError(f"Directory traversal detected in internal path: {path}")
+
+        return temp_dir / cleaned_internal
+
     potential_zip, _ = split_zip_path(path)
     if potential_zip:
         raise ZipNotLoadedError(f"ZIP file '{potential_zip}' is not loaded (or path '{path}' is invalid).")
-    
-    # Not a zip path, return absolute path
+
     return Path(path).resolve()
+
+
+# 後方互換性用エイリアス
+find_longest_match_handle = find_matching_session

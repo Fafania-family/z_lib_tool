@@ -3,20 +3,17 @@ import shutil
 import tempfile
 import zipfile
 from pathlib import Path
-from .._types import ZipHandle, OpenMode
-from ..exceptions import ZipPathError
+from typing import Optional
 
-# Windows製ZIPはCP932(Shift-JIS)でエンコードされているが、
-# Python の zipfile は UTF-8 フラグなしのエントリを CP437 として扱うため文字化けが発生する。
-# このフラグで UTF-8 フラグの有無を確認し、なければ CP437バイト列 を CP932 として再デコードする。
+from .._types import ZipHandle, OpenMode
+from ..exceptions import ZipPathError, ZipSecurityError, ZipSaveError
+
+# Windows製ZIPのCP932(Shift-JIS)ダメ文字(\x5c)化けを回避するため、
+# UTF-8フラグがない場合はLocal File Headerから生のバイト列を取得する。
 _FLAG_UTF8 = 0x800
 
 
 def _decode_zip_filename(zf: zipfile.ZipFile, info: zipfile.ZipInfo) -> str:
-    """
-    ZIPエントリ名を正しくデコードして返す。
-    ダメ文字(\x5c)に対応するため、元の生バイト列を直接取得してデコードする。
-    """
     if info.flag_bits & _FLAG_UTF8:
         return info.filename
 
@@ -24,18 +21,15 @@ def _decode_zip_filename(zf: zipfile.ZipFile, info: zipfile.ZipInfo) -> str:
         current_pos = zf.fp.tell()
         zf.fp.seek(info.header_offset)
         header = zf.fp.read(30)
-        # Check Local File Header signature
         if header[:4] == b'PK\x03\x04':
             name_len = int.from_bytes(header[26:28], 'little')
             raw_bytes = zf.fp.read(name_len)
             zf.fp.seek(current_pos)
-            # Replace backslashes with slashes for safety before returning
             return raw_bytes.decode("cp932").replace("\\", "/")
         zf.fp.seek(current_pos)
     except Exception:
         pass
 
-    # フォールバック (レガシー)
     try:
         raw_bytes = info.filename.encode("cp437")
         return raw_bytes.decode("cp932")
@@ -43,46 +37,82 @@ def _decode_zip_filename(zf: zipfile.ZipFile, info: zipfile.ZipInfo) -> str:
         return info.filename
 
 
-def _extract_with_encoding(zf: zipfile.ZipFile, dest_dir: str) -> None:
-    """
-    文字化け対策済みのZIP展開処理。
-    各エントリ名を正しくデコードしてからdest_dirへ展開する。
-    """
-    for info in zf.infolist():
-        correct_name = _decode_zip_filename(zf, info)
-        dest_path = Path(dest_dir) / correct_name
+def _sanitize_and_validate_path(entry_name: str, dest_dir: Path) -> Path:
+    # Zip Slip（親ディレクトリへの脱出）および絶対パス攻撃を防御する
+    cleaned = entry_name.replace("\\", "/").lstrip("/")
+    if cleaned.startswith("../") or "/../" in cleaned or cleaned == "..":
+        raise ZipSecurityError(f"Directory traversal detected in ZIP entry: {entry_name}")
 
-        if correct_name.endswith("/") or info.is_dir():
-            # ディレクトリエントリ
-            dest_path.mkdir(parents=True, exist_ok=True)
-        else:
-            dest_path.parent.mkdir(parents=True, exist_ok=True)
-            with zf.open(info) as src, open(dest_path, "wb") as dst:
-                shutil.copyfileobj(src, dst)
+    dest_root = dest_dir.resolve()
+    target_path = (dest_root / cleaned).resolve()
+    try:
+        target_path.relative_to(dest_root)
+    except ValueError:
+        raise ZipSecurityError(f"Path traversal outside destination directory: {entry_name}")
+
+    return target_path
+
+
+def extract_zip_safely(zip_path: Path, dest_dir: Path) -> None:
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        with zipfile.ZipFile(zip_path, "r") as zf:
+            for info in zf.infolist():
+                decoded_name = _decode_zip_filename(zf, info)
+                target_path = _sanitize_and_validate_path(decoded_name, dest_dir)
+
+                if decoded_name.endswith("/") or info.is_dir():
+                    target_path.mkdir(parents=True, exist_ok=True)
+                else:
+                    target_path.parent.mkdir(parents=True, exist_ok=True)
+                    with zf.open(info) as src, open(target_path, "wb") as dst:
+                        shutil.copyfileobj(src, dst)
+    except Exception:
+        # 展開途中の破損やセキュリティ例外時に不完全な残骸を残さない
+        if dest_dir.exists():
+            shutil.rmtree(dest_dir, ignore_errors=True)
+        raise
+
+
+def compress_directory_to_zip(source_dir: Path, target_zip_path: Path) -> None:
+    target_zip_path.parent.mkdir(parents=True, exist_ok=True)
+    with zipfile.ZipFile(target_zip_path, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+        for root, dirs, files in os.walk(source_dir):
+            for d in dirs:
+                dir_path = Path(root) / d
+                rel_dir = dir_path.relative_to(source_dir).as_posix() + "/"
+                # 空ディレクトリを欠落させないため、ディレクトリエントリとして登録する
+                zf.writestr(rel_dir, b"")
+            for f in files:
+                file_path = Path(root) / f
+                arcname = file_path.relative_to(source_dir).as_posix()
+                zf.write(file_path, arcname)
+
+    # 書き込み直後に整合性を検証し、壊れたアーカイブによる元ファイル上書きを防ぐ
+    with zipfile.ZipFile(target_zip_path, "r") as zf:
+        bad_file = zf.testzip()
+        if bad_file is not None:
+            raise ZipSaveError(f"Generated ZIP verification failed at entry: {bad_file}")
 
 
 class ZipFileBackend:
-    def open(self, path: str, create: bool, mode: OpenMode = "rw") -> ZipHandle:
+    """後方互換性および単体利用のためのバックエンドクラス"""
+    def open(self, path: str, create: bool, mode: OpenMode = "r") -> ZipHandle:
         path_obj = Path(path).resolve()
+        if not path_obj.exists() and not create:
+            raise FileNotFoundError(f"ZIP file not found: {path}")
 
-        if not path_obj.exists():
-            if not create:
-                raise FileNotFoundError(f"ZIP file not found: {path}")
+        temp_dir = Path(tempfile.mkdtemp(prefix="z_lib_"))
 
-        # 一時ディレクトリを作成
-        temp_dir = tempfile.mkdtemp(prefix="z_lib_")
-
-        if path_obj.exists() and zipfile.is_zipfile(path_obj):
-            # 文字化け対策済みの展開関数を使用
-            with zipfile.ZipFile(path_obj, "r") as zf:
-                _extract_with_encoding(zf, temp_dir)
-        elif path_obj.exists() and not zipfile.is_zipfile(path_obj):
-            shutil.rmtree(temp_dir)
-            raise ZipPathError(f"File exists but is not a valid ZIP file: {path}")
+        if path_obj.exists():
+            if not zipfile.is_zipfile(path_obj):
+                shutil.rmtree(temp_dir, ignore_errors=True)
+                raise ZipPathError(f"File exists but is not a valid ZIP file: {path}")
+            extract_zip_safely(path_obj, temp_dir)
 
         return ZipHandle(
             path=str(path_obj),
-            temp_dir=temp_dir,
+            temp_dir=str(temp_dir),
             mode=mode,
         )
 
@@ -93,31 +123,9 @@ class ZipFileBackend:
 
         try:
             if save and mode == "rw" and temp_dir.exists():
-                if not original_path.parent.exists():
-                    original_path.parent.mkdir(parents=True, exist_ok=True)
-
-                fd, temp_zip_path = tempfile.mkstemp(
-                    dir=original_path.parent, suffix=".tmp_zip"
-                )
-                os.close(fd)
-
-                try:
-                    with zipfile.ZipFile(
-                        temp_zip_path, "w", compression=zipfile.ZIP_DEFLATED
-                    ) as zf:
-                        for root, _dirs, files in os.walk(temp_dir):
-                            for file in files:
-                                file_path = Path(root) / file
-                                arcname = file_path.relative_to(temp_dir)
-                                zf.write(file_path, arcname)
-
-                    shutil.move(temp_zip_path, original_path)
-
-                except Exception:
-                    if os.path.exists(temp_zip_path):
-                        os.remove(temp_zip_path)
-                    raise
-
+                tmp_zip = temp_dir.parent / f"{temp_dir.name}_temp.zip"
+                compress_directory_to_zip(temp_dir, tmp_zip)
+                shutil.move(str(tmp_zip), str(original_path))
         finally:
             if temp_dir.exists():
                 shutil.rmtree(temp_dir, ignore_errors=True)

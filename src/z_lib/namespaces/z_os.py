@@ -1,11 +1,12 @@
 import os
 from typing import Any, Iterator, List, Tuple, TYPE_CHECKING
 from pathlib import Path
-from ..path_resolver import normalize_path
+from ..path_resolver import normalize_path, find_matching_session
 from .z_os_path import Z_OS_Path
 
 if TYPE_CHECKING:
     from ..core import Z_Lib
+
 
 class Z_OS:
     def __init__(self, z_lib: "Z_Lib"):
@@ -14,83 +15,105 @@ class Z_OS:
 
     def listdir(self, path: str) -> List[str]:
         real_path = self._z_lib.resolve(path)
-        print(f"  📁 [Z_OS] listdir   › {path}")
+        self._z_lib._log(f"  📁 [Z_OS] listdir   › {path}")
         result = os.listdir(real_path)
-        print(f"     └─ {len(result)} entries")
+        self._z_lib._log(f"     └─ {len(result)} entries")
         return result
 
     def mkdir(self, path: str, mode: int = 0o777) -> None:
+        session = self._z_lib._get_session_for_path(path)
+        if session:
+            session.check_writable("mkdir")
         real_path = self._z_lib.resolve(path)
-        print(f"  📂 [Z_OS] mkdir   › {path}")
+        self._z_lib._log(f"  📂 [Z_OS] mkdir   › {path}")
         os.mkdir(real_path, mode)
-        
+        if session:
+            session.mark_dirty()
+
     def makedirs(self, path: str, mode: int = 0o777, exist_ok: bool = False) -> None:
+        session = self._z_lib._get_session_for_path(path)
+        if session:
+            session.check_writable("makedirs")
         real_path = self._z_lib.resolve(path)
-        print(f"  📂 [Z_OS] makedirs   exist_ok={exist_ok}   › {path}")
+        self._z_lib._log(f"  📂 [Z_OS] makedirs   exist_ok={exist_ok}   › {path}")
         os.makedirs(real_path, mode, exist_ok)
+        if session:
+            session.mark_dirty()
 
     def remove(self, path: str) -> None:
+        session = self._z_lib._get_session_for_path(path)
+        if session:
+            session.check_writable("remove")
         real_path = self._z_lib.resolve(path)
-        print(f"  🗑  [Z_OS] remove   › {path}")
+        self._z_lib._log(f"  🗑  [Z_OS] remove   › {path}")
         os.remove(real_path)
-        
+        if session:
+            session.mark_dirty()
+
     def rmdir(self, path: str) -> None:
+        session = self._z_lib._get_session_for_path(path)
+        if session:
+            session.check_writable("rmdir")
         real_path = self._z_lib.resolve(path)
-        print(f"  🗑  [Z_OS] rmdir   › {path}")
+        self._z_lib._log(f"  🗑  [Z_OS] rmdir   › {path}")
         os.rmdir(real_path)
+        if session:
+            session.mark_dirty()
 
     def rename(self, src: str, dst: str) -> None:
+        session_src = self._z_lib._get_session_for_path(src)
+        session_dst = self._z_lib._get_session_for_path(dst)
+        if session_src:
+            session_src.check_writable("rename (source)")
+        if session_dst:
+            session_dst.check_writable("rename (destination)")
+
         real_src = self._z_lib.resolve(src)
         real_dst = self._z_lib.resolve(dst)
-        print(f"  ✏️  [Z_OS] rename   {src} → {dst}")
+        self._z_lib._log(f"  ✏️  [Z_OS] rename   {src} → {dst}")
         os.rename(real_src, real_dst)
 
-    def walk(self, top: str, topdown: bool = True, onerror: Any = None, followlinks: bool = False) -> Iterator[Tuple[str, List[str], List[str]]]:
-        """
-        透過的なディレクトリ木ジェネレータ。
-        ローカルディレクトリを走査する際に、ロード済みZIPファイルを
-        自動的にディレクトリとして展開して返す。
-        Yields: (仮想パス, サブディレクトリ名リスト, ファイル名リスト)
-        """
-        print(f"  🔎 [Z_OS] walk   topdown={topdown}   › {top}")
+        if session_src:
+            session_src.mark_dirty()
+        if session_dst and session_dst != session_src:
+            session_dst.mark_dirty()
+
+    def walk(
+        self,
+        top: str,
+        topdown: bool = True,
+        onerror: Any = None,
+        followlinks: bool = False
+    ) -> Iterator[Tuple[str, List[str], List[str]]]:
+        self._z_lib._log(f"  🔎 [Z_OS] walk   topdown={topdown}   › {top}")
         yield from self._walk_recursive(normalize_path(top), topdown, onerror, followlinks)
 
     def _walk_recursive(
         self, virtual_top: str, topdown: bool, onerror: Any, followlinks: bool
     ) -> Iterator[Tuple[str, List[str], List[str]]]:
-        """
-        再帰的 walk の実装。
-        - ロード済みZIPのパスに一致する場合 → ZIPの一時ディレクトリを起点に走査
-        - ローカルディレクトリの場合 → os.listdir で一覧を取得し、
-          ロード済みZIPファイルをディレクトリとして扱い再帰する
-        """
-        loaded_zips = self._z_lib._loaded_zips  # Dict[str, ZipHandle]
+        sessions = self._z_lib._sessions
 
-        # --- ケース1: virtual_top がロード済みZIPのパスに完全一致 or その内部パス ---
-        from ..path_resolver import find_longest_match_handle
-        handle, internal_path = find_longest_match_handle(virtual_top, loaded_zips)
+        session, internal_path = find_matching_session(virtual_top, sessions)
+        if session:
+            temp_dir_raw = session.temp_dir if hasattr(session, "temp_dir") else session["temp_dir"]
+            temp_dir = Path(temp_dir_raw)
+            real_top = temp_dir / internal_path
+            orig_path_str = str(session.original_path) if hasattr(session, "original_path") else session["path"]
+            canonical_zip_key = normalize_path(orig_path_str)
 
-        if handle:
-            # ZIPの一時ディレクトリを起点にローカルwalkし、仮想パスに変換して yield
-            real_top = Path(handle["temp_dir"]) / internal_path
             for root, dirs, files in os.walk(real_top, topdown=topdown, onerror=onerror, followlinks=followlinks):
                 try:
-                    rel = Path(root).relative_to(Path(handle["temp_dir"]))
+                    rel = Path(root).relative_to(temp_dir)
                 except ValueError:
                     continue
-                # rel は ZIPのキー (ロード時のパス) からの相対位置を意味する
-                # virtual path = [zip_key] / [rel]
-                zip_key = next(
-                    k for k, v in loaded_zips.items() if v["temp_dir"] == handle["temp_dir"]
-                )
+
                 if str(rel) == ".":
-                    virtual_root = zip_key
+                    virtual_root = canonical_zip_key
                 else:
-                    virtual_root = f"{zip_key}/{normalize_path(str(rel))}"
+                    virtual_root = f"{canonical_zip_key}/{normalize_path(str(rel))}"
                 yield virtual_root, dirs, files
             return
 
-        # --- ケース2: ローカルディレクトリ ---
         real_top = Path(virtual_top).resolve()
         if not real_top.is_dir():
             if onerror:
@@ -104,37 +127,34 @@ class Z_OS:
                 onerror(e)
             return
 
-        # ロード済みZIPキーを正規化済みセットとして準備
-        loaded_zip_norms = set(loaded_zips.keys())
+        # ロード済みZIPの絶対パス集合
+        loaded_zip_paths = set()
+        for s in sessions.values():
+            p = s.original_path if hasattr(s, "original_path") else Path(s["path"])
+            loaded_zip_paths.add(p.resolve())
 
         sub_dirs: List[str] = []
         sub_files: List[str] = []
-        # エントリを仕分け：ロード済みZIPはディレクトリ扱い
-        zip_entries: List[str] = []  # このディレクトリ内のロード済みZIP名
+        zip_entries: List[str] = []
 
         for entry in entries:
-            norm_entry = normalize_path(str(entry.resolve()))
+            entry_resolved = entry.resolve()
             if entry.is_dir() and not (entry.is_symlink() and not followlinks):
                 sub_dirs.append(entry.name)
-            elif norm_entry in loaded_zip_norms:
-                # ロード済みZIPをディレクトリとして扱う
+            elif entry_resolved in loaded_zip_paths:
                 zip_entries.append(entry.name)
             else:
                 sub_files.append(entry.name)
 
-        # topdown=True: 先に現在ディレクトリを yield し、その後再帰
-        # dirs に zip_entries を含める（ユーザーが dirs を編集できるよう）
         virtual_dirs = sub_dirs + zip_entries
 
         if topdown:
             yield virtual_top, virtual_dirs, sub_files
 
-        # ローカルサブディレクトリを再帰
         for d in sub_dirs:
             child_virtual = f"{virtual_top}/{d}"
             yield from self._walk_recursive(child_virtual, topdown, onerror, followlinks)
 
-        # ロード済みZIPを再帰（ディレクトリとして展開）
         for zname in zip_entries:
             child_virtual = normalize_path(str((real_top / zname).resolve()))
             yield from self._walk_recursive(child_virtual, topdown, onerror, followlinks)

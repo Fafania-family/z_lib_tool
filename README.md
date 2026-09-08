@@ -1,15 +1,23 @@
 # Z_Lib
 
-ZIPファイルとローカルファイルを透過的に扱うためのPythonライブラリです。
-標準の `os` や `shutil` ライブラリに近いインターフェースを提供し、ZIPファイルを一時ディレクトリにマウントすることで、パフォーマンスを犠牲にすることなく読み書きを容易にします。
+Box Drive等のクラウド同期ストレージ環境における**大量の小ファイル処理**を劇的に高速化・安全化するためのPythonライブラリです。
 
-## 特徴
+ZIPアーカイブを転送単位としてローカル一時領域に全展開し、標準の `os` や `shutil` ライブラリと同等のインターフェースで透過的にアクセスします。読み取り専用の安全性を担保しつつ、明示的なトランザクション（編集・コミット・ロールバック）によりクラウド上のファイル破損や競合を防ぎます。
 
+---
+
+## 主な特徴
+
+- **クラウド小ファイルアクセスの高速化**: Box Drive上の大量の小ファイルを個別に読み書きする際のネットワーク遅延を回避。ZIP単位でローカルに取得・全展開し、ローカルSSD上で処理を完結させます。
 - **透過的なアクセス**: ZIPファイル内のパスを、通常のフォルダのように扱うことができます（例: `archive.zip/data/file.txt`）。
-- **絶対・相対パスの両立**: ZIPファイルを相対パスでロードしても絶対パスでアクセスでき、その逆も可能です。ライブラリ内部でパスを自動的に正規化・解決します。
-- **明示的なステート管理**: ZIPファイルを `load` している間だけ実体化し、`unload` 時に一括で再圧縮・保存します。これにより、頻繁な解凍・圧縮操作を避け、高速なランダムアクセスを可能にします。
-- **外部ライブラリ連携**: `open()` や `resolve()` メソッドにより、Pillow, Polars, Pandas などの「実際のファイルパス」や「ファイルオブジェクト」を必要とするライブラリとシームレスに連携できます。
-- **マルチプロセス対応**: `resolve()` で取得した物理パスをワーカープロセスに渡すことで、並列処理も安全に行えます。
+- **安全な読み取り専用（既定 `mode="r"`）**: 解析目的の処理が元ZIPを誤って書き換えないよう、変更操作（書き込み・削除・移動）を呼び出し時点で確実にブロック（`ZipReadOnlyError`）。
+- **明示的なトランザクション（`commit` / `rollback` / `edit`）**: 変更の保存・破棄を利用者が制御。コンテキストマネージャー（`with z.edit(...)`）に対応し、処理途中で例外が発生しても元ZIPを一切破壊しません。
+- **更新競合検知 & データ保護**: ロード後に元ZIPが外部で変更された場合の競合検知（`ZipConflictError`）や、保存失敗時の編集データ保護（`ZipSaveError.recovery_path`）を完備。
+- **日本語ダメ文字（CP932/0x5C）対応**: Windowsで作成されたShift-JISのZIPファイル（「表」「能」など）も文字化けせずに完全復元。
+- **空ディレクトリ保持 & Zip Slip防御**: 空ディレクトリを欠落させず、悪意ある相対パストラバーサルを自動遮断。
+- **外部ライブラリ連携**: `resolve()` により、Polars, Pillow, xlwings など「実際のファイルパス」を必要とするライブラリとシームレスに連携。
+
+---
 
 ## インストール
 
@@ -17,96 +25,121 @@ ZIPファイルとローカルファイルを透過的に扱うためのPython�
 uv add git+https://github.com/Nafania-family/z-lib-tool.git
 ```
 
-## 使い方
+---
 
-### 基本フロー
+## クイックスタート
+
+### 1. 読み取り（解析用途・既定）
+
+既定の `mode="r"` では、元ZIPの破壊や不要なクラウド同期は一切発生しません。
 
 ```python
 from z_lib import Z_Lib
 
-# インスタンス作成
 z = Z_Lib()
 
-# 1. ZIPファイルをロード（mode="rw" で書き込み可能に）
-z.load_zip("data.zip", mode="rw")
+# 1. Box Drive上のZIPをマウント (ローカルに安全取得・展開)
+z.load_zip("path/to/box_drive/dataset.zip")
 
-# 2. ファイルを読み込む
-with z.open("data.zip/hello.txt", "r") as f:
-    print(f.read())
+# 2. 透過的に読み取り
+with z.open("path/to/box_drive/dataset.zip/meta.json", "r", encoding="utf-8") as fp:
+    print(fp.read())
 
-# 3. アンロード（変更があれば元ファイルに反映される）
-z.unload_zip("data.zip")
+# 3. 透過的な os / shutil 操作
+for root, dirs, files in z.os.walk("path/to/box_drive/dataset.zip"):
+    print(f"{root}: {len(files)} files")
+
+# 4. 作業領域の安全な解放
+z.close("path/to/box_drive/dataset.zip")
 ```
 
-### 透過的な OS / Shutil 操作
+### 2. 安全な編集（トランザクション）
 
-`z.os` および `z.shutil` を使用すると、既存のコードを最小限の変更でZIP対応させることができます。
+#### コンテキストマネージャーを使う場合（推奨）
+ブロックを正常に抜けた場合のみ元ZIPへアトミックに書き戻されます。例外発生時は自動的にロールバックされ、元ZIPは保護されます。
 
 ```python
-# ファイル一覧の取得
-files = z.os.listdir("data.zip/images")
-
-# フォルダ作成
-z.os.makedirs("data.zip/new_folder", exist_ok=True)
-
-# ディレクトリの再帰探索 (仮想パスを返します)
-for root, dirs, files in z.os.walk("data.zip"):
-    print(f"Directory: {root}")
-    for f in files:
-        print(f"  File: {f}")
-
-# ファイルコピー (ZIP内、またはZIP↔ローカル間)
-z.shutil.copy2("data.zip/source.txt", "data.zip/backup.txt")
-z.shutil.copy2("local_config.yaml", "data.zip/config.yaml")
-
-# ファイル削除
-z.os.remove("data.zip/temp.tmp")
+with z.edit("path/to/box_drive/dataset.zip"):
+    with z.open("path/to/box_drive/dataset.zip/output.txt", "w", encoding="utf-8") as fp:
+        fp.write("processed result")
+    # ここで例外が起きても、元ZIPは一切書き換わりません
 ```
 
-### 外部ライブラリとの連携 (Pillow, Polars 等)
-
-物理的なパスやファイルハンドルが必要な場合も簡単です。
+#### 明示的に commit / rollback を呼ぶ場合
 
 ```python
-from PIL import Image
+z.load_zip("dataset.zip", mode="rw")
+
+with z.open("dataset.zip/config.ini", "w") as fp:
+    fp.write("key=value")
+
+# 編集内容を破棄して初期状態に戻す
+z.rollback("dataset.zip")
+
+# 編集を確定して元ZIPへアトミック書き戻し
+# z.commit("dataset.zip")
+
+z.close("dataset.zip")
+```
+
+---
+
+## 高度な利用例
+
+### 外部ライブラリ連携 (Polars, Pillow など)
+
+展開先の一時実パスを渡すことで、外部プロセスやC拡張ライブラリからも直接扱えます。
+
+```python
 import polars as pl
+from PIL import Image
 
-# open() を使う (ファイルオブジェクトを渡す)
-with z.open("data.zip/photo.jpg", "rb") as f:
-    img = Image.open(f)
+real_csv_path = z.resolve("dataset.zip/table.csv")
+df = pl.read_csv(real_csv_path)
+
+with z.open("dataset.zip/image.png", "rb") as fp:
+    img = Image.open(fp)
     img.show()
-
-# resolve() を使う (一時展開された物理パスを取得)
-# Polarsなどの外部プロセスやライブラリにパスを直接渡せます
-real_path = z.resolve("data.zip/data.csv")
-df = pl.read_csv(real_path)
 ```
 
-### 高度な機能
+### 作業領域（高速SSD等）のカスタム設定
 
-#### `swap_zip`: ロード状態の宣言的同期
-
-現在のロード状態をターゲットのリストと同期させます。不要なものはアンロードし、不足しているものだけをロードします。
+大容量ZIPや大量ファイルの展開先として、NVMe SSD等の高速ストレージを明示的に指定できます。
 
 ```python
-# zip1 をアンロードし、zip2, zip3 をロードする（差分のみ処理）
-z.swap_zip(["zip2.zip", "zip3.zip"])
+z = Z_Lib(workspace_dir="D:/fast_nvme_temp")
 ```
 
-#### `load_nest`: フォルダ内のZIPを一括読込
+### `swap_zip`: ロード状態の宣言的同期
 
-指定したフォルダを再帰的に探索し、見つかったすべてのZIPファイルを読み取り専用でロードします。
+現在のロード状態を指定リストの状態と差分同期させます。同じZIPの不要な再展開を防ぎます。
 
 ```python
-# 解析用ディレクトリ内の全ZIPをマウント
-z.load_nest("path/to/archive_folder")
+# target.zip のみをロードし、それ以外を自動クローズ
+z.swap_zip(["path/to/target.zip"])
 ```
 
-## 仕様と制限
+### `load_nest`: フォルダ配下の全ZIP一括ロード
 
-- **自動クリーンアップ**: プログラム終了時にロード中のZIPは自動的に `unload`（保存）されます。
-- **読み取り専用モード**: `mode="r"` (デフォルト) でロードした場合、ZIP内への変更はアンロード時に破棄されます。
-- **一時ディレクトリ**: 展開先はOSのデフォルトの一時ディレクトリ（`/tmp` や `%TEMP%`）です。
+フォルダ内のすべての `.zip` ファイルを再帰探索して読み取り専用でロードします。
+
+```python
+z.load_nest("path/to/box_drive/monthly_reports/")
+```
+
+---
+
+## エラーハンドリング
+
+| 例外クラス | 発生条件 |
+|---|---|
+| `ZipReadOnlyError` | `mode="r"` のZIPに対して書き込み・削除・作成を試みた場合 |
+| `ZipConflictError` | ロード後に外部（別端末やプロセス）で元ZIPが更新・削除されていた場合 |
+| `ZipSaveError` | 再圧縮・検証・書き戻しに失敗した場合。`error.recovery_path` で未保存データを救出可能 |
+| `ZipSecurityError` | `../` など展開先外への脱出を試みる不正なパスを検出した場合 |
+| `ZipNotLoadedError` | マウントされていないZIP内部のパスにアクセスした場合 |
+
+---
 
 ## ライセンス
 
